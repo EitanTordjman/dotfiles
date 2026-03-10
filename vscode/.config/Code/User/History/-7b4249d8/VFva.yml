@@ -1,0 +1,44 @@
+services:
+  oracle-db:
+    image: container-registry.oracle.com/database/express:21.3.0-xe
+    container_name: oracle-db
+    ports:
+      - "1521:1521"   # Oracle listener
+      - "5500:5500"   # Oracle EM Express (web console)
+    environment:
+      ORACLE_PWD: Oracle123!        # SYS/SYSTEM/PDBADMIN password
+      ORACLE_CHARACTERSET: AL32UTF8
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+    healthcheck:
+      test: ["CMD", "/opt/oracle/checkDBStatus.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s  # Oracle XE takes a while to initialize
+
+  nifi:
+    image: apache/nifi:1.25.0
+    container_name: nifi
+    ports:
+      - "8443:8443"   # NiFi HTTPS UI
+    environment:
+      SINGLE_USER_CREDENTIALS_USERNAME: admin
+      SINGLE_USER_CREDENTIALS_PASSWORD: adminpassword123  # min 12 chars
+    volumes:
+      - nifi-conf:/opt/nifi/nifi-current/conf
+      - nifi-content-repository:/opt/nifi/nifi-current/content_repository
+      - nifi-database-repository:/opt/nifi/nifi-current/database_repository
+      - nifi-flowfile-repository:/opt/nifi/nifi-current/flowfile_repository
+      - nifi-provenance-repository:/opt/nifi/nifi-current/provenance_repository
+    depends_on:
+      oracle-db:
+        condition: service_healthy
+
+volumes:
+  oracle-data:
+  nifi-conf:
+  nifi-content-repository:
+  nifi-database-repository:
+  nifi-flowfile-repository:
+  nifi-provenance-repository:

@@ -1,0 +1,13 @@
+{
+    "editor.fontSize": 15,
+    "terminal.integrated.fontSize": 14,
+    "terminal.integrated.defaultProfile.osx": "fish",
+    "workbench.colorTheme": "Default Dark+",
+    "workbench.colorCustomizations": {
+        "terminal.background": "#00000000"
+    },
+    "terminal.integrated.gpuAcceleration": "off",
+    "window.systemColorTheme": "dark",
+    "window.autoDetectColorScheme": false,
+    "window.titleBarStyle": "custom"
+}

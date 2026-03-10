@@ -1,0 +1,65 @@
+{
+    "version": "",
+    "database": {
+        "name": "",
+        "server": "",
+        "analyzedAt": ""
+    },
+    "schemas": [
+        {
+            "name": "",
+            "tables": [
+                {
+                    "name": "",
+                    "rowCount": 0,
+                    "dependsOn": [
+                        {
+                            "schema": "",
+                            "table": "",
+                            "column": "",
+                            "referencedColumn": ""
+                        }
+                    ],
+                    "dependents": [
+                        {
+                            "schema": "",
+                            "table": "",
+                            "column": "",
+                            "referencedColumn": ""
+                        }
+                    ],
+                    "columns": [
+                        {
+                            "name": "",
+                            "dataType": "",
+                            "isNullable": false,
+                            "isPrimaryKey": false,
+                            "isForeignKey": false,
+                            "defaultValue": "",
+                            "descriptionIterations": [
+                                {
+                                    "generatedAt": "",
+                                    "description": "",
+                                    "reasoning": ""
+                                }
+                            ],
+                            "statistics": {
+                                "totalRows": 0,
+                                "distinctCount": 0,
+                                "uniquenessRatio": 0,
+                                "nullCount": 0,
+                                "nullPercentage": 0,
+                                "sampleValues": [
+                                    ""
+                                ]
+                            },
+                            "description": ""
+                        }
+                    ],
+                    "dependencyLevel": 0,
+                    "description": ""
+                }
+            ]
+        }
+    ]
+}

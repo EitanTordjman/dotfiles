@@ -1,0 +1,24 @@
+{
+    "editor.fontSize": 15,
+    "terminal.integrated.fontSize": 14,
+    "terminal.integrated.defaultProfile.osx": "fish",
+    "workbench.colorTheme": "Catppuccin Mocha",
+    "workbench.colorCustomizations": {
+        "terminal.background": "#00000000"
+    },
+    "window.titleBarStyle": "custom",
+    "vscode_vibrancy.preferedDarkTheme": "Catppuccin Mocha",
+    "vscode_vibrancy.theme": "Catppuccin Mocha",
+    "terminal.integrated.gpuAcceleration": "off",
+    "window.systemColorTheme": "dark",
+    "window.autoDetectColorScheme": false,
+    "vscode_vibrancy.imports": [
+        "/path/to/file"
+    ],
+    "python.analysis.typeCheckingMode": "strict",
+    "editor.fontFamily": "CaskaydiaCove Nerd Font",
+    "terminal.integrated.fontFamily": "CaskaydiaCove Nerd Font",
+    "terminal.integrated.fontLigatures.enabled": true,
+    "claudeCode.preferredLocation": "panel",
+    "claudeCode.useTerminal": true
+}

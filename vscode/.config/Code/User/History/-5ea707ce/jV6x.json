@@ -1,0 +1,75 @@
+{
+    "version": "",
+    "database": {
+        "name": "",
+        "server": "",
+        "analyzedAt": ""
+    },
+    "schemas": [
+        {
+            "name": "",
+            "tables": [
+                {
+                    "name": "",
+                    "dependsOn": [
+                        {
+                            "schema": "",
+                            "table": "",
+                            "column": "",
+                            "referencedColumn": ""
+                        }
+                    ],
+                    "dependents": [
+                        {
+                            "schema": "",
+                            "table": "",
+                            "column": "",
+                            "referencedColumn": ""
+                        }
+                    ],
+                    "dependencyLevel": 0,
+                    "descriptions": [
+                        {
+                            "timestamp": "",
+                            "description": "",
+                            "reasoning": null,
+                            "confidence": 0,
+                            "editorType": "",
+                            "model": "",
+                            "trigger": "",
+                            "author": "",
+                            "editNote": ""
+                        }
+                    ],
+                    "columns": [
+                        {
+                            "name": "",
+                            "dataType": "",
+                            "isNullable": false,
+                            "isPrimaryKey": false,
+                            "isForeignKey": false,
+                            "defaultValue": "",
+                            "sampleValues": [
+                                ""
+                            ],
+                            "descriptions": [
+                                {
+                                    "timestamp": "",
+                                    "description": "",
+                                    "reasoning": null,
+                                    "confidence": 0,
+                                    "editorType": "",
+                                    "model": "",
+                                    "trigger": "",
+                                    "author": "",
+                                    "editNote": ""
+                                }
+                            ]
+
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

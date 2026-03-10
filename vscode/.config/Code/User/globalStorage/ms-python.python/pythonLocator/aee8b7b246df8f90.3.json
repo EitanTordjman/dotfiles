@@ -1,0 +1,84 @@
+{
+  "environment": {
+    "executable": "/usr/local/bin/python3",
+    "prefix": "/Library/Frameworks/Python.framework/Versions/3.12",
+    "version": "3.12.7.final.0",
+    "is64Bit": true,
+    "symlinks": [
+      "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+      "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12",
+      "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+      "/Library/Frameworks/Python.framework/Versions/Current/bin/python3.12",
+      "/usr/local/bin/python3",
+      "/usr/local/bin/python3.12"
+    ]
+  },
+  "symlinks": [
+    [
+      "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+      {
+        "secs_since_epoch": 1727753953,
+        "nanos_since_epoch": 0
+      },
+      {
+        "secs_since_epoch": 1727753953,
+        "nanos_since_epoch": 0
+      }
+    ],
+    [
+      "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12",
+      {
+        "secs_since_epoch": 1727753953,
+        "nanos_since_epoch": 0
+      },
+      {
+        "secs_since_epoch": 1727753953,
+        "nanos_since_epoch": 0
+      }
+    ],
+    [
+      "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+      {
+        "secs_since_epoch": 1727753953,
+        "nanos_since_epoch": 0
+      },
+      {
+        "secs_since_epoch": 1727753953,
+        "nanos_since_epoch": 0
+      }
+    ],
+    [
+      "/Library/Frameworks/Python.framework/Versions/Current/bin/python3.12",
+      {
+        "secs_since_epoch": 1727753953,
+        "nanos_since_epoch": 0
+      },
+      {
+        "secs_since_epoch": 1727753953,
+        "nanos_since_epoch": 0
+      }
+    ],
+    [
+      "/usr/local/bin/python3",
+      {
+        "secs_since_epoch": 1727753953,
+        "nanos_since_epoch": 0
+      },
+      {
+        "secs_since_epoch": 1727753953,
+        "nanos_since_epoch": 0
+      }
+    ],
+    [
+      "/usr/local/bin/python3.12",
+      {
+        "secs_since_epoch": 1727753953,
+        "nanos_since_epoch": 0
+      },
+      {
+        "secs_since_epoch": 1727753953,
+        "nanos_since_epoch": 0
+      }
+    ]
+  ]
+}

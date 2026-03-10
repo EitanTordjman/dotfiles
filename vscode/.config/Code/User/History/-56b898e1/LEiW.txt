@@ -1,0 +1,1386 @@
+Here is the complete implementation plan for Memento's LLM Worker Service.
+
+---
+
+## Memento LLM Worker Service -- Implementation Plan
+
+---
+
+### 1. File-by-File Breakdown
+
+The worker service lives at `/Users/eitantordjman/Desktop/Harambe/memento/services/llm-worker/` and has the following structure:
+
+```
+services/llm-worker/
+    __init__.py
+    main.py              # Entry point: signal handling, connection setup, consumer start
+    consumer.py          # Message consumption, dispatch by task_type, ack/nack logic
+    executor.py          # LLM call execution with retry + backoff
+    prompt_renderer.py   # Jinja2 template loading and rendering
+    config.py            # Configuration: env vars, defaults, dynamic config polling
+    concurrency.py       # DynamicSemaphore + control queue listener
+    json_utils.py        # JSON cleanup (markdown fence stripping, repair)
+    health.py            # Optional lightweight health check HTTP endpoint
+    requirements.txt
+    templates/           # Jinja2 .md.j2 prompt templates (ported from DBAutoDoc)
+        table-analysis.md.j2
+        semantic-comparison.md.j2
+        backpropagation.md.j2
+        dependency-level-sanity-check.md.j2
+        schema-level-sanity-check.md.j2
+        cross-schema-sanity-check.md.j2
+```
+
+**`main.py`** -- Entry point. Responsibilities:
+- Parse configuration from environment variables via `config.py`
+- Establish aio-pika connection to RabbitMQ with reconnection logic
+- Declare all exchanges, queues, and DLQ bindings (idempotent)
+- Instantiate the `PromptRenderer`, `DynamicSemaphore`, and `Consumer`
+- Start the control queue listener for dynamic concurrency updates
+- Register SIGTERM/SIGINT handlers for graceful shutdown
+- Run the asyncio event loop
+
+**`consumer.py`** -- Message consumption and dispatch. Responsibilities:
+- Set prefetch_count (QoS) on the channel
+- Subscribe to the three task queues: `analyze_table`, `backprop`, `sanity_check`
+- Deserialize incoming messages into the appropriate Pydantic task model (`AnalyzeTableTask`, `BackpropTask`, `SanityCheckTask`, `SemanticCompareTask`)
+- Acquire the dynamic semaphore before dispatching to the executor
+- On successful result: publish the result message to the `memento.results` exchange, then ack
+- On JSON parse failure from LLM: publish a result with `success=False`, then ack (no retry -- the LLM just gave bad output)
+- On unrecoverable error: nack with `requeue=False` (sends to DLQ)
+- On transient LLM error after retry exhaustion: nack with `requeue=False` (sends to DLQ)
+
+**`executor.py`** -- LLM call execution with retry. Responsibilities:
+- Accept a rendered prompt string, AIConfig, and task metadata
+- Call litellm's `acompletion()` with the appropriate parameters
+- Implement retry with exponential backoff for specific error classes (429 rate limit, 500/502/503 server errors, connection timeouts)
+- Return a structured `ExecutionResult` containing: success flag, parsed JSON (if applicable), raw output, tokens_used, cost, error_message
+- Track retry attempts and abort after max retries
+
+**`prompt_renderer.py`** -- Template loading and rendering. Responsibilities:
+- Initialize Jinja2 `Environment` with `FileSystemLoader` pointing to the `templates/` directory
+- Register custom filters: `tojson` with indent, inline JSON
+- Expose a `render(prompt_name: str, context: dict) -> str` method
+- Cache compiled templates (Jinja2 does this internally)
+- Raise a clear error if a template is missing
+
+**`config.py`** -- Configuration management. Responsibilities:
+- Define a `WorkerConfig` Pydantic model for all settings
+- Load from environment variables with sensible defaults
+- Expose a `get_config()` function
+
+**`concurrency.py`** -- Dynamic concurrency control. Responsibilities:
+- Implement a `DynamicSemaphore` class that wraps `asyncio.Semaphore` but supports changing the limit at runtime
+- Listen on a RabbitMQ control queue (`worker.control`) for concurrency update messages
+- Optionally poll a Redis/MongoDB key for the current concurrency setting (secondary mechanism)
+
+**`json_utils.py`** -- JSON response cleanup. Responsibilities:
+- Strip markdown code fences (` ```json ... ``` `) from LLM output
+- Handle trailing commas, unescaped characters
+- Return the parsed dict or raise a clear `JSONParseError`
+
+**`health.py`** -- Lightweight health check (optional for container orchestration). Responsibilities:
+- Run a small aiohttp server on a configurable port (e.g., 8080)
+- Expose `GET /health` that returns 200 if the RabbitMQ connection is alive
+
+---
+
+### 2. Queue Management
+
+#### 2.1 Connection Setup
+
+```python
+# main.py -- key signatures and patterns
+
+import asyncio
+import signal
+from aio_pika import connect_robust, ExchangeType
+from config import get_config
+from consumer import Consumer
+from concurrency import DynamicSemaphore, ControlQueueListener
+from prompt_renderer import PromptRenderer
+
+async def main():
+    config = get_config()
+
+    # connect_robust handles automatic reconnection
+    connection = await connect_robust(
+        config.rabbitmq_url,
+        heartbeat=60,
+        connection_name=f"llm-worker-{config.worker_id}",
+    )
+
+    channel = await connection.channel()
+
+    # QoS: prefetch_count controls how many unacked messages
+    # this consumer holds at once. Start equal to concurrency limit.
+    await channel.set_qos(prefetch_count=config.initial_concurrency)
+
+    # Declare topology (idempotent -- safe to repeat)
+    await declare_topology(channel)
+
+    # Build components
+    renderer = PromptRenderer(config.templates_dir)
+    semaphore = DynamicSemaphore(config.initial_concurrency)
+    consumer = Consumer(channel, renderer, semaphore, config)
+
+    # Start control queue listener for dynamic concurrency
+    control_listener = ControlQueueListener(channel, semaphore, consumer)
+    asyncio.create_task(control_listener.start())
+
+    # Start consuming from all task queues
+    await consumer.start()
+
+    # Graceful shutdown on signals
+    loop = asyncio.get_event_loop()
+    shutdown_event = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda: shutdown_event.set())
+
+    await shutdown_event.wait()
+    await consumer.shutdown()
+    await connection.close()
+```
+
+#### 2.2 Exchange and Queue Declaration
+
+```python
+# main.py -- declare_topology
+
+async def declare_topology(channel):
+    """Declare all exchanges, queues, and bindings. Idempotent."""
+
+    # Exchanges
+    tasks_exchange = await channel.declare_exchange(
+        "memento.tasks", ExchangeType.DIRECT, durable=True
+    )
+    results_exchange = await channel.declare_exchange(
+        "memento.results", ExchangeType.DIRECT, durable=True
+    )
+    dlq_exchange = await channel.declare_exchange(
+        "memento.dlq", ExchangeType.DIRECT, durable=True
+    )
+    control_exchange = await channel.declare_exchange(
+        "memento.control", ExchangeType.FANOUT, durable=True
+    )
+
+    # DLQ queues (no special arguments)
+    for name in ("dlq.analyze_table", "dlq.backprop", "dlq.sanity_check"):
+        dlq_queue = await channel.declare_queue(name, durable=True)
+        await dlq_queue.bind(dlq_exchange, routing_key=name)
+
+    # Task queues with DLQ and TTL
+    queue_args = {
+        "x-dead-letter-exchange": "memento.dlq",
+        "x-message-ttl": 300000,  # 5 minutes
+    }
+
+    for queue_name in ("analyze_table", "backprop", "sanity_check"):
+        args = {**queue_args, "x-dead-letter-routing-key": f"dlq.{queue_name}"}
+        queue = await channel.declare_queue(
+            queue_name, durable=True, arguments=args
+        )
+        await queue.bind(tasks_exchange, routing_key=queue_name)
+
+    # Results queue (coordinator consumes this)
+    results_queue = await channel.declare_queue("results", durable=True)
+    await results_queue.bind(results_exchange, routing_key="results")
+
+    # Control queue (per-worker, exclusive, auto-delete)
+    # Each worker gets its own ephemeral control queue bound to the fanout exchange
+    control_queue = await channel.declare_queue(
+        "", exclusive=True, auto_delete=True
+    )
+    await control_queue.bind(control_exchange)
+
+    return tasks_exchange, results_exchange, control_queue
+```
+
+Key design decisions:
+- `connect_robust` from aio-pika provides automatic reconnection with exponential backoff -- no manual retry logic needed for the AMQP connection itself.
+- `prefetch_count` is set to match the initial concurrency. This ensures RabbitMQ only delivers N messages at a time, preventing one worker from hoarding messages it cannot process.
+- The control exchange is `FANOUT` so all worker instances receive concurrency update broadcasts.
+- Each worker creates an exclusive, auto-delete control queue so no cleanup is needed when workers shut down.
+
+#### 2.3 Consumer Setup and Message Flow
+
+```python
+# consumer.py
+
+import logging
+from aio_pika import IncomingMessage, Message
+from aio_pika.abc import AbstractChannel
+from pydantic import ValidationError
+
+# Shared message models (from shared/messages/)
+from shared.messages.tasks import (
+    AnalyzeTableTask, SemanticCompareTask, BackpropTask, SanityCheckTask
+)
+from shared.messages.results import (
+    AnalyzeTableResult, SemanticCompareResult, BackpropResult, SanityCheckResult
+)
+from executor import Executor, ExecutionResult
+from prompt_renderer import PromptRenderer
+from concurrency import DynamicSemaphore
+from config import WorkerConfig
+
+logger = logging.getLogger(__name__)
+
+# Map task_type string to Pydantic model class
+TASK_MODELS = {
+    "analyze_table": AnalyzeTableTask,
+    "semantic_compare": SemanticCompareTask,
+    "backprop": BackpropTask,
+    "sanity_check": SanityCheckTask,
+}
+
+# Map task_type to result model class
+RESULT_MODELS = {
+    "analyze_table": AnalyzeTableResult,
+    "semantic_compare": SemanticCompareResult,
+    "backprop": BackpropResult,
+    "sanity_check": SanityCheckResult,
+}
+
+
+class Consumer:
+    def __init__(
+        self,
+        channel: AbstractChannel,
+        renderer: PromptRenderer,
+        semaphore: DynamicSemaphore,
+        config: WorkerConfig,
+    ):
+        self._channel = channel
+        self._renderer = renderer
+        self._semaphore = semaphore
+        self._config = config
+        self._executor = Executor(config)
+        self._consuming = True
+        self._in_flight: set[asyncio.Task] = set()
+        self._results_exchange = None  # set during start()
+
+    async def start(self):
+        """Subscribe to all task queues."""
+        self._results_exchange = await self._channel.get_exchange("memento.results")
+
+        for queue_name in ("analyze_table", "backprop", "sanity_check"):
+            queue = await self._channel.get_queue(queue_name)
+            await queue.consume(self._on_message)
+
+        logger.info("Consumer started, listening on analyze_table, backprop, sanity_check")
+
+    async def _on_message(self, message: IncomingMessage):
+        """
+        Called by aio-pika for each incoming message.
+        Wraps processing in a task so multiple messages can be handled concurrently
+        (up to the semaphore limit).
+        """
+        task = asyncio.create_task(self._process_message(message))
+        self._in_flight.add(task)
+        task.add_done_callback(self._in_flight.discard)
+
+    async def _process_message(self, message: IncomingMessage):
+        """Full message processing pipeline: deserialize -> render -> LLM -> publish result -> ack."""
+        try:
+            # 1. Deserialize
+            body = message.body.decode("utf-8")
+            raw = json.loads(body)
+            task_type = raw.get("task_type")
+
+            if task_type not in TASK_MODELS:
+                logger.error(f"Unknown task_type: {task_type}")
+                await message.nack(requeue=False)  # -> DLQ
+                return
+
+            task_model_cls = TASK_MODELS[task_type]
+            try:
+                task = task_model_cls.model_validate(raw)
+            except ValidationError as e:
+                logger.error(f"Task deserialization failed: {e}")
+                await message.nack(requeue=False)  # -> DLQ
+                return
+
+            # 2. Acquire semaphore (blocks if at concurrency limit)
+            async with self._semaphore:
+                # 3. Render prompt
+                rendered_prompt = self._renderer.render(
+                    task.prompt_name, self._build_template_context(task)
+                )
+
+                # 4. Execute LLM call (with retries)
+                exec_result = await self._executor.execute(
+                    rendered_prompt=rendered_prompt,
+                    ai_config=task.ai_config,
+                    task_type=task_type,
+                    task_id=task.task_id,
+                )
+
+            # 5. Build result message
+            result_msg = self._build_result(task, exec_result)
+
+            # 6. Publish result to results exchange
+            await self._results_exchange.publish(
+                Message(
+                    body=result_msg.model_dump_json().encode("utf-8"),
+                    content_type="application/json",
+                    delivery_mode=2,  # persistent
+                ),
+                routing_key="results",
+            )
+
+            # 7. Ack ONLY after result is published
+            await message.ack()
+            logger.info(
+                f"Processed {task_type} task_id={task.task_id} "
+                f"success={exec_result.success} tokens={exec_result.tokens_used}"
+            )
+
+        except Exception as e:
+            logger.exception(f"Unrecoverable error processing message: {e}")
+            # Unrecoverable -> DLQ
+            await message.nack(requeue=False)
+
+    def _build_template_context(self, task) -> dict:
+        """Convert task model to dict suitable for Jinja2 template rendering."""
+        # Each task type has its own context shape.
+        # The task's self-contained context fields map directly to template variables.
+        if hasattr(task, 'context'):
+            # AnalyzeTableTask, BackpropTask -- have a TableAnalysisContext
+            ctx = task.context.model_dump()
+            # Add extra fields that templates expect
+            ctx["tableName"] = task.table_name
+            ctx["schemaName"] = task.schema_name
+            if hasattr(task, 'child_insights'):
+                ctx["insights"] = task.child_insights
+            return ctx
+        elif task.task_type == "semantic_compare":
+            return {
+                "schemaName": task.schema_name,
+                "tableName": task.table_name,
+                "previousTableDescription": task.previous_table_description,
+                "previousColumns": task.previous_columns,
+                "currentTableDescription": task.current_table_description,
+                "currentColumns": task.current_columns,
+                "previousIteration": task.previous_iteration,
+                "currentIteration": task.current_iteration,
+            }
+        elif task.task_type == "sanity_check":
+            return task.context  # already a dict
+        else:
+            return task.model_dump()
+
+    def _build_result(self, task, exec_result: ExecutionResult):
+        """Build the appropriate result Pydantic model from the execution result."""
+        # Common fields present on all result types
+        common = {
+            "task_id": task.task_id,
+            "correlation_id": task.correlation_id,
+            "analysis_id": task.analysis_id,
+            "schema_name": getattr(task, "schema_name", ""),
+            "table_name": getattr(task, "table_name", ""),
+            "success": exec_result.success,
+            "error_message": exec_result.error_message,
+            "tokens_used": exec_result.tokens_used,
+            "cost": exec_result.cost,
+        }
+
+        if task.task_type == "analyze_table":
+            if exec_result.success and exec_result.parsed_output:
+                p = exec_result.parsed_output
+                common.update({
+                    "table_description": p.get("tableDescription"),
+                    "column_descriptions": p.get("columnDescriptions"),
+                    "confidence": p.get("confidence"),
+                    "reasoning": p.get("reasoning"),
+                    "foreign_keys": p.get("foreignKeys"),
+                    "inferred_business_domain": p.get("inferredBusinessDomain"),
+                    "prompt_input": exec_result.prompt_input,
+                    "prompt_output": exec_result.raw_output,
+                })
+            return AnalyzeTableResult(**common)
+
+        elif task.task_type == "semantic_compare":
+            if exec_result.success and exec_result.parsed_output:
+                p = exec_result.parsed_output
+                common.update({
+                    "table_materially_changed": p.get("tableMateriallyChanged"),
+                    "table_change_reasoning": p.get("tableChangeReasoning"),
+                    "column_changes": p.get("columnChanges"),
+                })
+            return SemanticCompareResult(**common)
+
+        elif task.task_type == "backprop":
+            if exec_result.success and exec_result.parsed_output:
+                p = exec_result.parsed_output
+                common.update({
+                    "table_description": p.get("revisedDescription") or p.get("tableDescription"),
+                    "confidence": p.get("confidence"),
+                    "reasoning": p.get("reasoning"),
+                })
+            return BackpropResult(**common)
+
+        elif task.task_type == "sanity_check":
+            common.update({
+                "check_type": task.check_type,
+                "scope": task.scope,
+            })
+            if exec_result.success and exec_result.parsed_output:
+                p = exec_result.parsed_output
+                common.update({
+                    "has_material_issues": p.get("hasMaterialIssues"),
+                    "issues_found": len(p.get("tableIssues", [])),
+                    "tables_affected": [
+                        i.get("tableName") for i in p.get("tableIssues", [])
+                    ],
+                    "result_detail": p,
+                    "prompt_input": exec_result.prompt_input,
+                    "prompt_output": exec_result.raw_output,
+                })
+            return SanityCheckResult(**common)
+
+    async def shutdown(self):
+        """Stop accepting new messages, wait for in-flight tasks to finish."""
+        self._consuming = False
+        # Cancel consumption on all queues
+        for queue_name in ("analyze_table", "backprop", "sanity_check"):
+            queue = await self._channel.get_queue(queue_name)
+            await queue.cancel(queue.tag)  # stop delivering new messages
+
+        # Wait for all in-flight tasks to complete (with timeout)
+        if self._in_flight:
+            logger.info(f"Draining {len(self._in_flight)} in-flight tasks...")
+            done, pending = await asyncio.wait(
+                self._in_flight, timeout=120  # 2 minute drain timeout
+            )
+            if pending:
+                logger.warning(
+                    f"{len(pending)} tasks did not finish in time, cancelling"
+                )
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        logger.info("Consumer shutdown complete")
+```
+
+#### 2.4 Acknowledgment Flow Summary
+
+| Scenario | Action |
+|----------|--------|
+| Successful LLM call + result published | `message.ack()` |
+| LLM returned unparseable JSON | Publish result with `success=False`, then `message.ack()` |
+| Unknown `task_type` | `message.nack(requeue=False)` -- goes to DLQ |
+| Pydantic validation failure on task | `message.nack(requeue=False)` -- goes to DLQ |
+| Transient LLM error after max retries | `message.nack(requeue=False)` -- goes to DLQ |
+| Unhandled exception | `message.nack(requeue=False)` -- goes to DLQ |
+| Worker process crashes (unacked message) | RabbitMQ auto-redelivers to another consumer |
+
+The critical invariant: **ack happens only after the result message has been confirmed published to the results exchange**. This guarantees that no work is silently lost.
+
+---
+
+### 3. Failure Handling
+
+#### 3.1 Error Classification
+
+Errors are classified into three categories that determine the retry behavior:
+
+**Retryable (transient) errors** -- retry with exponential backoff:
+- HTTP 429 (rate limit exceeded) -- the most common case
+- HTTP 500, 502, 503 (LLM provider server errors)
+- Connection timeouts / network errors
+- `litellm.exceptions.RateLimitError`
+- `litellm.exceptions.ServiceUnavailableError`
+- `litellm.exceptions.APIConnectionError`
+- `asyncio.TimeoutError`
+
+**Non-retryable application errors** -- publish `success=False` result, then ack:
+- JSON parse failure (LLM returned invalid JSON)
+- Missing expected fields in LLM output
+- Template rendering error (prompt template is broken)
+
+**Unrecoverable infrastructure errors** -- nack to DLQ:
+- Unknown task_type
+- Pydantic validation error on inbound task message
+- Authentication failure (bad API key) -- `litellm.exceptions.AuthenticationError`
+- Invalid model name -- `litellm.exceptions.NotFoundError`
+- All retries exhausted on transient errors
+
+#### 3.2 Retry Implementation
+
+```python
+# executor.py
+
+import asyncio
+import time
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+import litellm
+from json_utils import clean_and_parse_json, JSONParseError
+from config import WorkerConfig
+
+logger = logging.getLogger(__name__)
+
+# Errors that should be retried
+RETRYABLE_EXCEPTIONS = (
+    litellm.exceptions.RateLimitError,
+    litellm.exceptions.ServiceUnavailableError,
+    litellm.exceptions.APIConnectionError,
+    litellm.exceptions.Timeout,
+    asyncio.TimeoutError,
+    ConnectionError,
+)
+
+# Errors that should NOT be retried -- go directly to DLQ
+FATAL_EXCEPTIONS = (
+    litellm.exceptions.AuthenticationError,
+    litellm.exceptions.NotFoundError,
+    litellm.exceptions.BadRequestError,
+)
+
+
+@dataclass
+class ExecutionResult:
+    success: bool
+    parsed_output: Optional[dict] = None
+    raw_output: Optional[str] = None
+    prompt_input: Optional[str] = None
+    tokens_used: int = 0
+    cost: float = 0.0
+    error_message: Optional[str] = None
+    retries_attempted: int = 0
+
+
+class Executor:
+    def __init__(self, config: WorkerConfig):
+        self._max_retries = config.max_retries          # default: 3
+        self._base_delay = config.retry_base_delay      # default: 2.0 seconds
+        self._max_delay = config.retry_max_delay         # default: 60.0 seconds
+        self._jitter = config.retry_jitter               # default: True
+        self._llm_timeout = config.llm_timeout           # default: 120 seconds
+
+    async def execute(
+        self,
+        rendered_prompt: str,
+        ai_config,  # AIConfig Pydantic model
+        task_type: str,
+        task_id: str,
+    ) -> ExecutionResult:
+        """Execute an LLM call with retry logic. Returns ExecutionResult."""
+
+        last_error = None
+
+        for attempt in range(self._max_retries + 1):
+            try:
+                if attempt > 0:
+                    delay = self._compute_backoff(attempt)
+                    logger.info(
+                        f"Retry {attempt}/{self._max_retries} for task {task_id} "
+                        f"after {delay:.1f}s delay"
+                    )
+                    await asyncio.sleep(delay)
+
+                # Call litellm
+                response = await litellm.acompletion(
+                    model=ai_config.model,
+                    messages=[
+                        {"role": "user", "content": rendered_prompt}
+                    ],
+                    temperature=ai_config.temperature,
+                    max_tokens=ai_config.max_tokens,
+                    response_format={"type": "json_object"},
+                    timeout=self._llm_timeout,
+                )
+
+                # Extract response content and usage
+                content = response.choices[0].message.content
+                usage = response.usage
+                tokens_used = (usage.total_tokens if usage else 0)
+                cost = litellm.completion_cost(
+                    completion_response=response
+                ) if usage else 0.0
+
+                # Parse JSON from LLM output
+                try:
+                    parsed = clean_and_parse_json(content)
+                except JSONParseError as e:
+                    # JSON parse failure is NOT retried -- the LLM output is
+                    # unlikely to improve on retry with the same prompt
+                    return ExecutionResult(
+                        success=False,
+                        raw_output=content,
+                        prompt_input=rendered_prompt,
+                        tokens_used=tokens_used,
+                        cost=cost,
+                        error_message=f"JSON parse failure: {e}",
+                        retries_attempted=attempt,
+                    )
+
+                return ExecutionResult(
+                    success=True,
+                    parsed_output=parsed,
+                    raw_output=content,
+                    prompt_input=rendered_prompt,
+                    tokens_used=tokens_used,
+                    cost=cost,
+                    retries_attempted=attempt,
+                )
+
+            except FATAL_EXCEPTIONS as e:
+                # Fatal: do not retry, raise to trigger DLQ nack
+                raise  # propagates to consumer._process_message exception handler
+
+            except RETRYABLE_EXCEPTIONS as e:
+                last_error = e
+                logger.warning(
+                    f"Retryable error on attempt {attempt + 1}/{self._max_retries + 1} "
+                    f"for task {task_id}: {type(e).__name__}: {e}"
+                )
+                # Extract retry-after header if present (rate limit responses)
+                retry_after = getattr(e, 'retry_after', None)
+                if retry_after and isinstance(retry_after, (int, float)):
+                    # Override computed backoff with server-suggested delay
+                    await asyncio.sleep(retry_after)
+                    continue
+                continue
+
+            except Exception as e:
+                # Unknown error -- treat as retryable for safety
+                last_error = e
+                logger.warning(
+                    f"Unexpected error on attempt {attempt + 1}: {type(e).__name__}: {e}"
+                )
+                continue
+
+        # All retries exhausted
+        error_msg = (
+            f"All {self._max_retries + 1} attempts failed for task {task_id}. "
+            f"Last error: {type(last_error).__name__}: {last_error}"
+        )
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)  # triggers DLQ nack in consumer
+
+    def _compute_backoff(self, attempt: int) -> float:
+        """Exponential backoff with optional jitter."""
+        delay = min(self._base_delay * (2 ** (attempt - 1)), self._max_delay)
+        if self._jitter:
+            import random
+            delay = delay * (0.5 + random.random())  # jitter: 50%-150% of computed delay
+        return delay
+```
+
+#### 3.3 Backoff Parameters
+
+| Parameter | Default | Env Var | Notes |
+|-----------|---------|---------|-------|
+| `max_retries` | 3 | `WORKER_MAX_RETRIES` | Total attempts = max_retries + 1 |
+| `retry_base_delay` | 2.0s | `WORKER_RETRY_BASE_DELAY` | Base for exponential formula |
+| `retry_max_delay` | 60.0s | `WORKER_RETRY_MAX_DELAY` | Cap on computed delay |
+| `retry_jitter` | True | `WORKER_RETRY_JITTER` | Prevents thundering herd |
+| `llm_timeout` | 120s | `WORKER_LLM_TIMEOUT` | Per-call timeout to litellm |
+
+Delay sequence with defaults (no jitter): 2s, 4s, 8s. With jitter: randomized around each value.
+
+If the LLM provider returns a `Retry-After` header (common with 429 responses), that value overrides the computed backoff. litellm exposes this on certain exception types.
+
+#### 3.4 DLQ Flow
+
+When a message is nacked with `requeue=False`, RabbitMQ routes it to the dead letter exchange `memento.dlq` and into the appropriate DLQ queue (e.g., `dlq.analyze_table`). The message retains all its original headers plus RabbitMQ adds `x-death` headers showing the rejection reason, queue of origin, and timestamp.
+
+The coordinator (or a separate monitoring process) should periodically check DLQ queue depth. This can be done via:
+- RabbitMQ Management API: `GET /api/queues/memento/dlq.analyze_table`
+- The coordinator consuming from DLQ queues and logging or re-dispatching
+
+DLQ messages contain the original task payload, so the coordinator can:
+1. Log the failure for the analysis run's processing_log
+2. Mark the table as `status: "error"` in MongoDB
+3. Optionally re-dispatch the task with different parameters (different model, higher timeout)
+
+---
+
+### 4. Dynamic Concurrency Limiting
+
+This is the most nuanced requirement. The design uses a **three-layer approach** that supports changing concurrency without restarting workers:
+
+#### 4.1 DynamicSemaphore
+
+The core primitive is a custom semaphore that can be resized at runtime:
+
+```python
+# concurrency.py
+
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class DynamicSemaphore:
+    """
+    An asyncio.Semaphore whose limit can be changed at runtime.
+
+    When the limit is increased, additional waiters are immediately released.
+    When the limit is decreased, no in-flight tasks are cancelled -- the new
+    limit takes effect as tasks complete and release their slots.
+    """
+
+    def __init__(self, initial_value: int = 5):
+        self._limit = initial_value
+        self._current_count = initial_value  # available slots
+        self._waiters: asyncio.Queue = asyncio.Queue()
+        self._lock = asyncio.Lock()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def available(self) -> int:
+        return max(0, self._current_count)
+
+    @property
+    def in_use(self) -> int:
+        return self._limit - self._current_count
+
+    async def acquire(self):
+        """Acquire a slot. Blocks if no slots available."""
+        async with self._lock:
+            if self._current_count > 0:
+                self._current_count -= 1
+                return
+
+        # No slot available -- wait
+        event = asyncio.Event()
+        await self._waiters.put(event)
+        await event.wait()
+
+    def release(self):
+        """Release a slot. Wakes one waiter if any are waiting."""
+        self._current_count += 1
+        # Try to wake a waiter
+        try:
+            event = self._waiters.get_nowait()
+            self._current_count -= 1
+            event.set()
+        except asyncio.QueueEmpty:
+            pass
+
+    async def set_limit(self, new_limit: int):
+        """
+        Change the concurrency limit at runtime.
+
+        If increasing: release additional slots immediately.
+        If decreasing: new limit takes effect as current tasks complete.
+        """
+        async with self._lock:
+            old_limit = self._limit
+            self._limit = new_limit
+            delta = new_limit - old_limit
+
+            if delta > 0:
+                # Increasing -- add slots and wake waiters
+                self._current_count += delta
+                # Wake up to 'delta' waiters
+                for _ in range(delta):
+                    try:
+                        event = self._waiters.get_nowait()
+                        self._current_count -= 1
+                        event.set()
+                    except asyncio.QueueEmpty:
+                        break
+            elif delta < 0:
+                # Decreasing -- reduce available count but don't interrupt in-flight
+                self._current_count += delta  # delta is negative
+                # current_count may go negative temporarily -- that's fine.
+                # It means new acquires will block until enough tasks release.
+
+            logger.info(
+                f"Concurrency limit changed: {old_limit} -> {new_limit} "
+                f"(available={self.available}, in_use={self.in_use})"
+            )
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *args):
+        self.release()
+```
+
+Key design property: When the limit decreases, in-flight tasks are never cancelled. The reduced limit takes effect naturally as tasks complete and release slots. The `_current_count` may temporarily go negative, which simply means more tasks must complete before any new acquisitions succeed.
+
+#### 4.2 Control Queue Mechanism (Primary -- No Restart Required)
+
+The coordinator (or an operator) publishes a message to the `memento.control` fanout exchange. Since every worker has its own exclusive queue bound to this exchange, all workers receive the update simultaneously.
+
+```python
+# concurrency.py (continued)
+
+import json
+from aio_pika import IncomingMessage
+from pydantic import BaseModel
+
+
+class ConcurrencyUpdate(BaseModel):
+    """Message format for concurrency control updates."""
+    action: str  # "set_concurrency"
+    value: int   # new concurrency limit
+
+
+class ControlQueueListener:
+    """
+    Listens on the worker's control queue for runtime configuration updates.
+    Currently supports: concurrency limit changes.
+    """
+
+    def __init__(
+        self,
+        channel,
+        semaphore: DynamicSemaphore,
+        consumer,  # Consumer instance, to update prefetch
+    ):
+        self._channel = channel
+        self._semaphore = semaphore
+        self._consumer = consumer
+
+    async def start(self):
+        """Begin consuming from the control queue."""
+        # The control queue was already declared in declare_topology()
+        # Find it by iterating declared queues, or store reference from declaration
+        control_queue = self._channel._control_queue  # set during topology declaration
+        await control_queue.consume(self._on_control_message)
+        logger.info("Control queue listener started")
+
+    async def _on_control_message(self, message: IncomingMessage):
+        """Handle a control message."""
+        try:
+            raw = json.loads(message.body.decode("utf-8"))
+            update = ConcurrencyUpdate.model_validate(raw)
+
+            if update.action == "set_concurrency":
+                new_limit = max(1, update.value)  # minimum 1
+                await self._semaphore.set_limit(new_limit)
+
+                # Also update RabbitMQ prefetch to match
+                await self._channel.set_qos(prefetch_count=new_limit)
+                logger.info(f"Prefetch updated to {new_limit}")
+
+            await message.ack()
+
+        except Exception as e:
+            logger.error(f"Error processing control message: {e}")
+            await message.ack()  # ack anyway -- don't DLQ control messages
+```
+
+**How an operator sends a concurrency update** (from coordinator or CLI):
+
+```python
+# Example: coordinator or management script
+async def set_worker_concurrency(connection, new_limit: int):
+    channel = await connection.channel()
+    exchange = await channel.get_exchange("memento.control")
+    msg = json.dumps({"action": "set_concurrency", "value": new_limit})
+    await exchange.publish(
+        Message(body=msg.encode("utf-8")),
+        routing_key="",  # fanout ignores routing key
+    )
+```
+
+This can also be exposed via the API service as an endpoint:
+```
+POST /admin/workers/concurrency
+{"concurrency": 10}
+```
+
+#### 4.3 Coordinating Prefetch with the Semaphore
+
+When concurrency is changed, two things must be updated in sync:
+
+1. **DynamicSemaphore limit** -- controls how many concurrent LLM calls are in flight within this worker process.
+2. **RabbitMQ prefetch_count** -- controls how many unacked messages RabbitMQ delivers to this consumer.
+
+These must stay synchronized. If prefetch is 5 but the semaphore allows 10, the semaphore limit is never reached because RabbitMQ only delivers 5 messages. If prefetch is 10 but the semaphore allows 5, messages pile up in the consumer waiting for semaphore slots, which wastes memory and prevents other workers from picking them up.
+
+The `ControlQueueListener._on_control_message` updates both atomically.
+
+#### 4.4 Data Flow for Concurrency Change
+
+```
+Operator/Coordinator
+    |
+    |  publish {"action": "set_concurrency", "value": 8}
+    |  to memento.control (fanout exchange)
+    |
+    v
+   RabbitMQ
+    |
+    +---> Worker 1 control queue  -> ControlQueueListener
+    |       -> DynamicSemaphore.set_limit(8)
+    |       -> channel.set_qos(prefetch_count=8)
+    |
+    +---> Worker 2 control queue  -> ControlQueueListener
+    |       -> DynamicSemaphore.set_limit(8)
+    |       -> channel.set_qos(prefetch_count=8)
+    |
+    +---> Worker N control queue  -> ControlQueueListener
+            -> ...
+```
+
+All workers update simultaneously. No restarts. No polling. The change takes effect immediately for new tasks; in-flight tasks continue to completion.
+
+---
+
+### 5. LLM Execution Flow
+
+The end-to-end flow for a single task, tracing through all components:
+
+```
+1. RabbitMQ delivers message to consumer
+       |
+2. consumer._on_message() spawns asyncio.Task
+       |
+3. consumer._process_message():
+   a. Decode JSON from message.body
+   b. Determine task_type from payload
+   c. Validate with Pydantic (AnalyzeTableTask, etc.)
+       |
+4. semaphore.acquire()  [blocks if at concurrency limit]
+       |
+5. prompt_renderer.render(task.prompt_name, context)
+   a. Load Jinja2 template by name (e.g., "table-analysis" -> "table-analysis.md.j2")
+   b. Build template context dict from task model
+   c. Render template to string
+       |
+6. executor.execute(rendered_prompt, ai_config, task_type, task_id)
+   a. Call litellm.acompletion() with model, messages, temperature, max_tokens
+   b. On success: extract content, usage, compute cost
+   c. On retryable error: sleep(backoff), retry up to max_retries
+   d. On fatal error: raise (triggers nack -> DLQ)
+   e. Parse JSON from LLM content:
+      - Strip markdown fences (```json ... ```)
+      - json.loads()
+      - On parse error: return ExecutionResult(success=False)
+       |
+7. semaphore.release()
+       |
+8. consumer._build_result(task, exec_result)
+   a. Map parsed JSON fields to result Pydantic model fields
+   b. Include tokens_used, cost, prompt_input, prompt_output
+       |
+9. Publish result to memento.results exchange (routing_key="results")
+       |
+10. message.ack()
+```
+
+**`prompt_renderer.py` implementation:**
+
+```python
+# prompt_renderer.py
+
+from jinja2 import Environment, FileSystemLoader, TemplateNotFound
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class PromptRenderer:
+    def __init__(self, templates_dir: str):
+        self._env = Environment(
+            loader=FileSystemLoader(templates_dir),
+            autoescape=False,  # prompts are not HTML
+            keep_trailing_newline=True,
+            undefined=jinja2.StrictUndefined,  # fail loudly on missing vars
+        )
+        self._register_filters()
+
+    def _register_filters(self):
+        """Register custom Jinja2 filters matching DBAutoDoc's Nunjucks filters."""
+        import json
+
+        # tojson is built-in in Jinja2, but ensure indent support
+        def json_filter(obj, indent=2):
+            return json.dumps(obj, indent=indent, default=str)
+
+        def jsoninline_filter(obj):
+            return json.dumps(obj, default=str)
+
+        self._env.filters["json"] = json_filter
+        self._env.filters["jsoninline"] = jsoninline_filter
+        # Jinja2 already has: tojson, join, round
+
+    def render(self, prompt_name: str, context: dict) -> str:
+        """
+        Render a prompt template with the given context.
+
+        prompt_name: template name without extension (e.g., "table-analysis")
+        context: dict of template variables
+        """
+        template_file = f"{prompt_name}.md.j2"
+        try:
+            template = self._env.get_template(template_file)
+            return template.render(**context)
+        except TemplateNotFound:
+            raise ValueError(
+                f"Prompt template '{template_file}' not found in templates directory"
+            )
+```
+
+**`json_utils.py` implementation:**
+
+```python
+# json_utils.py
+
+import json
+import re
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class JSONParseError(Exception):
+    """Raised when LLM output cannot be parsed as JSON."""
+    pass
+
+
+def clean_and_parse_json(content: str) -> dict:
+    """
+    Clean LLM output and parse as JSON.
+
+    Handles common LLM output issues:
+    1. Markdown code fences (```json ... ```)
+    2. Leading/trailing whitespace
+    3. BOM characters
+
+    Mirrors DBAutoDoc's CleanAndParseJSON utility from @memberjunction/global.
+    """
+    if not content or not content.strip():
+        raise JSONParseError("Empty content")
+
+    cleaned = content.strip()
+
+    # Remove BOM if present
+    cleaned = cleaned.lstrip('\ufeff')
+
+    # Remove markdown code fences
+    # Pattern: ```json ... ``` or ``` ... ```
+    fence_pattern = r'^```(?:json)?\s*\n?(.*?)\n?\s*```$'
+    match = re.match(fence_pattern, cleaned, re.DOTALL)
+    if match:
+        cleaned = match.group(1).strip()
+
+    # Also handle case where content starts with ``` but doesn't end with it
+    if cleaned.startswith('```'):
+        # Remove first line (the opening fence)
+        lines = cleaned.split('\n', 1)
+        if len(lines) > 1:
+            cleaned = lines[1]
+        # Remove trailing fence if present
+        if cleaned.rstrip().endswith('```'):
+            cleaned = cleaned.rstrip()[:-3].rstrip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        # Try one more approach: find the first { and last }
+        first_brace = cleaned.find('{')
+        last_brace = cleaned.rfind('}')
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            try:
+                return json.loads(cleaned[first_brace:last_brace + 1])
+            except json.JSONDecodeError:
+                pass
+
+        raise JSONParseError(
+            f"Failed to parse JSON: {e}\nContent (first 500 chars): {cleaned[:500]}"
+        )
+```
+
+---
+
+### 6. Graceful Shutdown
+
+The shutdown sequence ensures no work is lost:
+
+```
+1. SIGTERM/SIGINT received
+       |
+2. shutdown_event.set()  (triggers main() to begin shutdown)
+       |
+3. consumer.shutdown():
+   a. Set self._consuming = False
+   b. Cancel consumption on all 3 task queues
+      (stop receiving new messages from RabbitMQ)
+       |
+4. Wait for in-flight tasks:
+   a. asyncio.wait(self._in_flight, timeout=120)
+   b. In-flight tasks continue to completion:
+      - LLM calls finish
+      - Results are published
+      - Messages are acked
+       |
+5. If timeout exceeded:
+   a. Cancel remaining tasks
+   b. These tasks' messages remain unacked
+   c. RabbitMQ will redeliver them to other workers
+       |
+6. connection.close()
+   a. Closes AMQP channel and connection cleanly
+   b. Any remaining unacked messages are redelivered by RabbitMQ
+```
+
+Key property: **Messages are only acked after results are published.** This means that even if the worker is killed mid-processing (SIGKILL), the message remains unacked and RabbitMQ redelivers it. The worst case is a duplicate LLM call, which is idempotent from the coordinator's perspective (it just receives the same result twice and deduplicates by correlation_id).
+
+The 120-second drain timeout is chosen to be longer than the LLM call timeout (120s), so most in-flight tasks will complete naturally. If a task is still running after 120 seconds, it is cancelled and the message gets redelivered.
+
+---
+
+### 7. Testing Strategy
+
+#### 7.1 What to Mock
+
+| Component | Mock | Real |
+|-----------|------|------|
+| RabbitMQ | aio-pika `IncomingMessage`, `Channel`, `Exchange` (mock objects) | Never -- unit tests use no real broker |
+| litellm | `litellm.acompletion` (patch) | Never -- unit tests make no real LLM calls |
+| Jinja2 templates | Real files (load from test fixtures directory) | Yes -- template rendering is fast and deterministic |
+| Pydantic models | Real shared models | Yes -- validation is the point |
+| `asyncio.sleep` | Patch to avoid waiting in retry tests | N/A |
+
+#### 7.2 Key Test Scenarios
+
+**`test_consumer.py`:**
+- `test_analyze_table_happy_path` -- mock message arrives, LLM returns valid JSON, result is published, message is acked
+- `test_unknown_task_type_nacks` -- message with unrecognized task_type is nacked to DLQ
+- `test_pydantic_validation_error_nacks` -- malformed task payload is nacked to DLQ
+- `test_json_parse_failure_publishes_error_result` -- LLM returns non-JSON, result with `success=False` is published, message is acked (not DLQ)
+- `test_unrecoverable_error_nacks` -- AuthenticationError from litellm triggers nack to DLQ
+- `test_result_published_before_ack` -- verify ack is called only after publish succeeds
+- `test_concurrent_messages_respect_semaphore` -- dispatch N messages with semaphore limit < N, verify only limit tasks run concurrently
+
+**`test_executor.py`:**
+- `test_successful_llm_call` -- single attempt, success
+- `test_retry_on_rate_limit` -- mock RateLimitError on attempt 1, success on attempt 2
+- `test_retry_on_server_error` -- mock ServiceUnavailableError, verify exponential backoff timing
+- `test_respects_retry_after_header` -- mock 429 with `retry_after=5`, verify sleep(5) is called
+- `test_max_retries_exhausted` -- all attempts fail, raises RuntimeError
+- `test_auth_error_not_retried` -- AuthenticationError immediately raises
+- `test_json_parse_failure_no_retry` -- valid LLM response but invalid JSON, returns `success=False` without retry
+- `test_backoff_computation` -- verify exponential delay with jitter bounds
+
+**`test_prompt_renderer.py`:**
+- `test_render_table_analysis` -- render the table-analysis template with a full context, verify output contains expected sections
+- `test_render_semantic_comparison` -- verify previous/current descriptions appear correctly
+- `test_missing_template_raises` -- request a nonexistent template name, verify ValueError
+- `test_strict_undefined` -- missing variable in context causes error (not silent empty string)
+- `test_custom_filters` -- verify `json` and `jsoninline` filters produce correct output
+
+**`test_json_utils.py`:**
+- `test_clean_json_with_fences` -- content wrapped in ` ```json ... ``` `
+- `test_clean_json_without_fences` -- plain JSON
+- `test_clean_json_with_bom` -- BOM character prefix
+- `test_clean_json_with_surrounding_text` -- JSON embedded in explanatory text
+- `test_invalid_json_raises` -- truly unparseable content
+
+**`test_concurrency.py`:**
+- `test_semaphore_basic_acquire_release` -- acquire and release within limit
+- `test_semaphore_blocks_at_limit` -- verify acquire blocks when all slots taken
+- `test_semaphore_increase_releases_waiters` -- increase limit from 2 to 4 while 2 tasks are waiting, verify they proceed
+- `test_semaphore_decrease_does_not_cancel` -- decrease limit from 5 to 2 while 4 tasks are in-flight, verify all 4 complete, and the 5th waiter blocks
+- `test_control_message_updates_semaphore` -- simulate a control queue message, verify semaphore limit changes
+
+**`test_shutdown.py`:**
+- `test_graceful_shutdown_waits_for_inflight` -- start 3 tasks, trigger shutdown, verify all 3 complete before exit
+- `test_shutdown_timeout_cancels` -- start a very slow task, trigger shutdown with short timeout, verify cancellation
+- `test_no_new_messages_after_shutdown` -- after shutdown begins, verify new messages are not consumed
+
+#### 7.3 Test Fixtures
+
+Place test fixture files at `services/llm-worker/tests/fixtures/`:
+- `sample_analyze_table_task.json` -- a complete AnalyzeTableTask payload
+- `sample_llm_response.json` -- a valid LLM JSON response for table-analysis
+- `sample_llm_response_with_fences.txt` -- LLM response wrapped in markdown fences
+- `templates/` -- copies of the Jinja2 templates for unit tests
+
+#### 7.4 Integration Test (optional, uses docker-compose)
+
+A single integration test that:
+1. Starts RabbitMQ in a test container
+2. Publishes a mock AnalyzeTableTask
+3. Runs the worker (with mocked litellm)
+4. Verifies the result message appears on the results queue
+5. Verifies ack behavior
+
+This lives in a separate `tests/integration/` directory and is not run in CI by default.
+
+---
+
+### 8. Configuration
+
+#### 8.1 All Environment Variables
+
+```python
+# config.py
+
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings
+import uuid
+
+
+class WorkerConfig(BaseSettings):
+    """All configuration for the LLM worker service."""
+
+    # Identity
+    worker_id: str = Field(
+        default_factory=lambda: str(uuid.uuid4())[:8],
+        description="Unique worker identifier for logging"
+    )
+
+    # RabbitMQ
+    rabbitmq_url: str = Field(
+        default="amqp://memento:memento@localhost:5672/",
+        description="AMQP connection URL"
+    )
+
+    # LLM
+    llm_api_key: str = Field(
+        default="",
+        description="LLM provider API key"
+    )
+    llm_provider: str = Field(
+        default="openai",
+        description="LLM provider name (openai, anthropic, etc.)"
+    )
+
+    # Concurrency
+    initial_concurrency: int = Field(
+        default=5,
+        description="Initial number of concurrent LLM calls per worker"
+    )
+
+    # Retry
+    max_retries: int = Field(
+        default=3,
+        description="Max retry attempts for transient LLM errors"
+    )
+    retry_base_delay: float = Field(
+        default=2.0,
+        description="Base delay in seconds for exponential backoff"
+    )
+    retry_max_delay: float = Field(
+        default=60.0,
+        description="Maximum delay in seconds for backoff"
+    )
+    retry_jitter: bool = Field(
+        default=True,
+        description="Add jitter to retry delays"
+    )
+
+    # Timeouts
+    llm_timeout: int = Field(
+        default=120,
+        description="Timeout in seconds for each LLM API call"
+    )
+    shutdown_drain_timeout: int = Field(
+        default=120,
+        description="Seconds to wait for in-flight tasks during shutdown"
+    )
+
+    # Templates
+    templates_dir: str = Field(
+        default="templates",
+        description="Path to Jinja2 prompt template directory"
+    )
+
+    # Logging
+    log_level: str = Field(
+        default="INFO",
+        description="Logging level"
+    )
+
+    class Config:
+        env_prefix = "WORKER_"
+        # Also accept without prefix for backward compat
+        env_file = ".env"
+
+
+def get_config() -> WorkerConfig:
+    return WorkerConfig()
+```
+
+#### 8.2 Environment Variable Reference Table
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `WORKER_RABBITMQ_URL` | `amqp://memento:memento@localhost:5672/` | AMQP connection string |
+| `WORKER_LLM_API_KEY` | (required) | API key for the LLM provider |
+| `WORKER_LLM_PROVIDER` | `openai` | Provider name for litellm |
+| `WORKER_INITIAL_CONCURRENCY` | `5` | Starting concurrent LLM call limit |
+| `WORKER_MAX_RETRIES` | `3` | Retry count for transient errors |
+| `WORKER_RETRY_BASE_DELAY` | `2.0` | Base backoff delay in seconds |
+| `WORKER_RETRY_MAX_DELAY` | `60.0` | Maximum backoff delay in seconds |
+| `WORKER_RETRY_JITTER` | `true` | Randomize retry delays |
+| `WORKER_LLM_TIMEOUT` | `120` | Per-call LLM timeout in seconds |
+| `WORKER_SHUTDOWN_DRAIN_TIMEOUT` | `120` | Shutdown drain timeout in seconds |
+| `WORKER_TEMPLATES_DIR` | `templates` | Path to Jinja2 templates |
+| `WORKER_LOG_LEVEL` | `INFO` | Python logging level |
+| `WORKER_WORKER_ID` | (auto-generated) | Worker instance identifier |
+
+---
+
+### 9. Implementation Sequence
+
+The recommended order for implementing these files:
+
+1. **`shared/messages/common.py`**, **`shared/messages/tasks.py`**, **`shared/messages/results.py`** -- The Pydantic message models are the foundation. These are already defined in `docs/03-message-contracts.md` and just need to be created as actual Python files.
+
+2. **`config.py`** -- Configuration is needed by everything else.
+
+3. **`json_utils.py`** -- Small, self-contained, easily testable.
+
+4. **`prompt_renderer.py`** -- Depends only on Jinja2 and the templates directory. Port the 6 critical Nunjucks templates from DBAutoDoc to Jinja2 at the same time.
+
+5. **`concurrency.py`** -- The `DynamicSemaphore` and `ControlQueueListener`. Testable in isolation.
+
+6. **`executor.py`** -- The retry logic around litellm calls. Depends on `json_utils.py` and `config.py`.
+
+7. **`consumer.py`** -- The message dispatch pipeline. Depends on all of the above.
+
+8. **`main.py`** -- The entry point that wires everything together.
+
+9. **Tests** -- Write tests alongside each file (steps 3-8), not as a separate phase.
+
+---
+
+### 10. Architectural Decision Rationale
+
+**Why a control queue instead of Redis/MongoDB polling for concurrency updates:**
+- The control queue is push-based: updates arrive instantly, not on a polling interval. When you need to throttle workers due to a rate limit spike, sub-second propagation matters.
+- It reuses the existing RabbitMQ infrastructure -- no additional Redis dependency.
+- A fanout exchange ensures all workers receive the update atomically.
+- The control queue is exclusive and auto-delete, so no cleanup overhead.
+
+**Why the semaphore + prefetch dual approach:**
+- The semaphore controls concurrency at the application level (how many LLM calls in flight).
+- The prefetch_count controls delivery at the transport level (how many messages RabbitMQ sends).
+- Without prefetch alignment, a worker with semaphore=5 but prefetch=100 would hoard 95 messages that other workers could process.
+- They must be kept in sync, which is why the control message handler updates both.
+
+**Why JSON parse errors are not retried:**
+- The same prompt with the same model will almost always produce the same malformed output. Retrying wastes tokens and money.
+- The coordinator can handle parse failures by logging them, continuing with other tables, and optionally retrying with a different model or adjusted prompt parameters.
+
+**Why fatal auth errors go to DLQ instead of infinite retry:**
+- A bad API key will never become a good API key by waiting. The operator needs to be notified and fix the key.
+- DLQ visibility (queue depth > 0) is the alerting mechanism.
+
+---
+
+### Critical Files for Implementation
+
+- `/Users/eitantordjman/Desktop/Harambe/memento/services/llm-worker/consumer.py` - Core message consumption, dispatch, ack/nack logic -- the central nervous system of the worker
+- `/Users/eitantordjman/Desktop/Harambe/memento/services/llm-worker/executor.py` - LLM call execution with retry/backoff -- the most failure-sensitive component
+- `/Users/eitantordjman/Desktop/Harambe/memento/services/llm-worker/concurrency.py` - DynamicSemaphore and control queue listener -- the novel runtime concurrency mechanism
+- `/Users/eitantordjman/Desktop/Harambe/memento/docs/03-message-contracts.md` - Canonical message schemas that define the shared contract between coordinator and worker
+- `/Users/eitantordjman/Desktop/Harambe/memento/src/prompts/PromptEngine.ts` - Reference implementation showing the render-call-parse pattern that the worker replicates in Python

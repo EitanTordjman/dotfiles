@@ -1,0 +1,48 @@
+{
+  "environment": {
+    "executable": "/Users/eitantordjman/Desktop/Harambe/Memento/.venv/bin/python",
+    "prefix": "/Users/eitantordjman/Desktop/Harambe/Memento/.venv",
+    "version": "3.13.3.final.0",
+    "is64Bit": true,
+    "symlinks": [
+      "/Users/eitantordjman/Desktop/Harambe/Memento/.venv/bin/python",
+      "/Users/eitantordjman/Desktop/Harambe/Memento/.venv/bin/python3",
+      "/Users/eitantordjman/Desktop/Harambe/Memento/.venv/bin/python3.13"
+    ]
+  },
+  "symlinks": [
+    [
+      "/Users/eitantordjman/Desktop/Harambe/Memento/.venv/bin/python",
+      {
+        "secs_since_epoch": 1744951585,
+        "nanos_since_epoch": 709243419
+      },
+      {
+        "secs_since_epoch": 1744951585,
+        "nanos_since_epoch": 688895532
+      }
+    ],
+    [
+      "/Users/eitantordjman/Desktop/Harambe/Memento/.venv/bin/python3",
+      {
+        "secs_since_epoch": 1744951585,
+        "nanos_since_epoch": 709243419
+      },
+      {
+        "secs_since_epoch": 1744951585,
+        "nanos_since_epoch": 688895532
+      }
+    ],
+    [
+      "/Users/eitantordjman/Desktop/Harambe/Memento/.venv/bin/python3.13",
+      {
+        "secs_since_epoch": 1744951585,
+        "nanos_since_epoch": 709243419
+      },
+      {
+        "secs_since_epoch": 1744951585,
+        "nanos_since_epoch": 688895532
+      }
+    ]
+  ]
+}
