@@ -1,0 +1,12 @@
+// Settings in here override those in "Default/Preferences.sublime-settings",
+// and are overridden in turn by syntax-specific settings.
+{
+    "font_face": "CaskaydiaCove Nerd Font",
+    "font_size": 15,
+    "theme": "Default Dark.sublime-theme",
+    "ignored_packages":
+    [
+		"Vintage",
+    ],
+    "color_scheme": "Catppuccin Mocha.sublime-color-scheme",
+}
