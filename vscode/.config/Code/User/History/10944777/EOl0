@@ -1,4 +1,0 @@
-#!python3
-import sys
-import Reflector
-sys.exit(Reflector.run_main(configure_logging=True))
