@@ -9,4 +9,5 @@
 		"Vintage",
     ],
     "color_scheme": "Catppuccin Mocha.sublime-color-scheme",
+    "index_files": true,
 }
